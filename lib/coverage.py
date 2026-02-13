@@ -79,13 +79,17 @@ def calculate_coverage_metrics(
     }
 
 
-def classify_tier(coverage: float) -> tuple[int, str]:
+def classify_tier(coverage: float, total_cost: float) -> tuple[int, str]:
     """
-    Classify portfolio into tier based on coverage.
+    Classify portfolio into tier based on coverage and cost.
 
     Returns:
         Tuple of (tier_number, tier_label)
     """
+    # Any cost >= 1.0 is speculative/junk (Tier 4)
+    if total_cost >= 1.0:
+        return 4, "LOW"
+
     for threshold, tier, label, _ in TIER_THRESHOLDS:
         if coverage >= threshold:
             return tier, label
@@ -144,6 +148,38 @@ def build_portfolio(
     if total_cost <= 0 or total_cost > 2.0:
         return None
 
+    # PRICE SANITY CHECK (The "Good Taste" Filter)
+    # If A => B is true, then P(B) must be >= P(A) in an efficient market.
+    # If the "cover" is significantly cheaper than the thing it guarantees,
+    # the LLM is likely hallucinating the logical necessity.
+    SANITY_MARGIN = 0.05
+    if cover_probability >= 0.95:  # Only for "Necessary" relationships
+        # Case Implied_By: OTHER => TARGET (so TargetPrice should be >= OtherPrice)
+        if target_position == "YES" and cover_position == "NO": # other YES => target YES
+             # This means cover_market.yes_price => target_market.yes_price
+             # which is equivalent to 1-cover_price => target_market.yes_price
+             pass # Logic varies by orientation, simpler to check payout relation
+
+    # Simplify: A hedge H for target T is valid only if P(payout) makes sense.
+    # If total_cost is very low but P(win) is claimed 98%, be suspicious.
+    # In Case 3: Target(NO@0.07) + Hedge(YES@0.07) = Cost 0.14, Coverage claimed 98%.
+    # But if Target fails, it means Fed Stayed. Fed Stayed => Cut 25 (Hedge) is 0%.
+    # So P(win) is actually 7%, not 98%.
+    
+    # Let's enforce that for a "Necessary" hedge, the cover price must 
+    # at least reflect the risk it's covering.
+    if cover_probability >= 0.95:
+        p_risk = 1.0 - target_price
+        # If the risk is 93% (p_risk=0.93) but the cover price is only 0.07,
+        # it's only a hedge if P(cover|risk) is high. 
+        # Market says P(cover) is 0.07. P(risk) is 0.93. 
+        # So P(cover|risk) = P(cover and risk) / P(risk) <= 0.07 / 0.93 = 7.5%.
+        # LLM says 98%. LLM is wrong.
+        
+        max_possible_cond_prob = cover_price / (1.0 - target_price) if target_price < 1.0 else 1.0
+        if max_possible_cond_prob < 0.5: # If market says it's <50% chance even in best case
+            return None # Discard hallucination
+
     # Calculate metrics
     metrics = calculate_coverage_metrics(target_price, cover_probability, total_cost)
 
@@ -152,7 +188,7 @@ def build_portfolio(
         return None
 
     # Classify tier
-    tier, tier_label = classify_tier(metrics["coverage"])
+    tier, tier_label = classify_tier(metrics["coverage"], total_cost)
 
     return {
         # Target info

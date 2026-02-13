@@ -46,6 +46,7 @@ class LLMClient:
         model: str = DEFAULT_MODEL,
         api_key: str | None = None,
         timeout: float = LLM_TIMEOUT,
+        base_url: str = OPENROUTER_BASE_URL,
     ):
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         if not self.api_key:
@@ -56,7 +57,7 @@ class LLMClient:
 
         self.model = model
         self.timeout = timeout
-        self.base_url = OPENROUTER_BASE_URL
+        self.base_url = base_url
 
         self._client: httpx.AsyncClient | None = None
 

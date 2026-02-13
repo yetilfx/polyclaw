@@ -7,6 +7,7 @@ Usage:
     hedge analyze <id1> <id2>     # Analyze specific market pair
 """
 
+import os
 import sys
 import json
 import re
@@ -22,7 +23,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from lib.gamma_client import GammaClient, Market
-from lib.llm_client import LLMClient, DEFAULT_MODEL
+from lib.llm_client import LLMClient, DEFAULT_MODEL,OPENROUTER_BASE_URL
 from lib.coverage import (
     NECESSARY_PROBABILITY,
     build_portfolio,
@@ -63,25 +64,27 @@ There must be ZERO possible scenarios where A=YES and B=NO. Not "unlikely" - IMP
 - "ceasefire broken" -> "war escalates" (WRONG: could de-escalate)
 - "sanctions imposed" -> "conflict worsens" (WRONG: correlation, not causation)
 - "candidate wins primary" -> "candidate wins general" (WRONG: can lose general)
+- **MUTUALLY EXCLUSIVE**: "Fed Stays" and "Fed Cuts 25" are MUTUALLY EXCLUSIVE. If one happens, the other DOES NOT. This is NOT an implication of YES. (A=YES => B=NO is true, but A=YES => B=YES is false).
+- **STRADDLES**: buying A=YES and B=NO just because they are in the same topic is NOT an implication.
 
 ## YOUR TASK
 
-Find relationships where events GUARANTEE each other:
+Find ONLY relationships that are true BY DEFINITION.
 
 ### 1. implied_by (OTHER -> TARGET): What GUARANTEES the target?
 - "If OTHER=YES, then TARGET=YES is 100% CERTAIN"
-- Must be definitionally or physically impossible for OTHER=YES and TARGET=NO
+- Example: "City captured" -> "Military entered city"
 
 ### 2. implies (TARGET -> OTHER): What does the target GUARANTEE?
 - "If TARGET=YES, then OTHER=YES is 100% CERTAIN"
-- BE VERY CAREFUL: This direction is often confused with correlation!
+- Example: "Person elected" -> "Election was held"
 
 ## STRICT COUNTEREXAMPLE TEST (REQUIRED)
 
 For EACH relationship, you MUST:
 1. Try to construct a scenario that violates the implication
 2. If you can imagine ANY such scenario (even unlikely), DO NOT INCLUDE IT
-3. Only include if the scenario is LOGICALLY IMPOSSIBLE
+3. **LOGIC CHECK**: If you are just guessing that "if they do X, they will probably do Y", STOP. That is a correlation.
 
 ## OUTPUT FORMAT (JSON only):
 ```json
@@ -381,9 +384,40 @@ async def cmd_scan(args):
         print("Need at least 2 markets to find hedges")
         return 1
 
+    # Filter out closed/resolved/settled markets (Temporal Guard)
+    active_markets = [
+        m for m in markets 
+        if not m.closed and not m.resolved and m.yes_price < 0.99 and m.no_price < 0.99
+    ]
+    if len(active_markets) < 2:
+        print("No enough active markets after temporal filter.")
+        return 0
+    
+    markets = active_markets
+
     # Initialize LLM client
     try:
-        llm = LLMClient(model=args.model)
+        model_id = os.getenv("ARK_MODEL_ID")
+        api_key = os.getenv("ARK_API_KEY")
+        base_url = os.getenv("ARK_BASE_URL")
+
+        if not all([model_id, api_key, base_url]):
+            missing = [k for k, v in {
+                "ARK_MODEL_ID": model_id, 
+                "ARK_API_KEY": api_key, 
+                "ARK_BASE_URL": base_url
+            }.items() if not v]
+            print(f"Error: Missing environment variables: {', '.join(missing)}")
+            print("Please set them in your .env file or environment.")
+            return 1
+
+        llm = LLMClient(
+            model=model_id,
+            api_key=api_key,
+            base_url=base_url
+        )
+        #llm = LLMClient(model="google/gemini-2.0-flash-lite-001")
+        
     except ValueError as e:
         print(f"Error: {e}")
         return 1
@@ -417,10 +451,20 @@ async def cmd_scan(args):
     if args.tier:
         all_portfolios = filter_portfolios_by_tier(all_portfolios, args.tier)
 
+    # Deduplicate symmetric pairs (A hedges B and B hedges A)
+    unique_portfolios = []
+    seen_pairs = set()
+    for p in all_portfolios:
+        pair = tuple(sorted([p["target_id"], p["cover_id"]]))
+        if pair not in seen_pairs:
+            unique_portfolios.append(p)
+            seen_pairs.add(pair)
+    all_portfolios = unique_portfolios
+
     all_portfolios = sort_portfolios(all_portfolios)
 
     # Output
-    print(f"\n=== Found {len(all_portfolios)} covering portfolios ===\n", file=sys.stderr)
+    print(f"\n=== Found {len(all_portfolios)} high-quality covering portfolios ===\n", file=sys.stderr)
 
     if args.json:
         print_portfolios_json(all_portfolios)
@@ -448,7 +492,27 @@ async def cmd_analyze(args):
 
     # Initialize LLM client
     try:
-        llm = LLMClient(model=args.model)
+        model_id = os.getenv("ARK_MODEL_ID")
+        api_key = os.getenv("ARK_API_KEY")
+        base_url = os.getenv("ARK_BASE_URL")
+
+        if not all([model_id, api_key, base_url]):
+            missing = [k for k, v in {
+                "ARK_MODEL_ID": model_id, 
+                "ARK_API_KEY": api_key, 
+                "ARK_BASE_URL": base_url
+            }.items() if not v]
+            print(f"Error: Missing environment variables: {', '.join(missing)}")
+            print("Please set them in your .env file or environment.")
+            return 1
+
+        llm = LLMClient(
+            model=model_id,
+            api_key=api_key,
+            base_url=base_url
+        )
+        # llm = LLMClient(model="google/gemini-2.0-flash-lite-001")
+        
     except ValueError as e:
         print(f"Error: {e}")
         return 1
