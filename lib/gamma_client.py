@@ -41,6 +41,16 @@ class MarketGroup:
     slug: str
     description: str
     markets: list[Market]
+    tags: list[str] = None
+
+
+@dataclass
+class Tag:
+    """Polymarket tag data."""
+
+    id: str
+    label: str
+    slug: str
 
 
 class GammaClient:
@@ -64,39 +74,123 @@ class GammaClient:
             resp.raise_for_status()
             return [self._parse_market(m) for m in resp.json()]
 
-    async def search_markets(self, query: str, limit: int = 20) -> list[Market]:
-        """Search markets by keyword.
+    async def public_search(
+        self, query: str, limit_per_type: int = 10
+    ) -> dict:
+        """Full-text search across events, tags, and profiles.
 
-        Note: Gamma API doesn't support server-side text search,
-        so we fetch a larger batch and filter client-side.
+        Returns a dict with 'events', 'tags', and 'profiles' keys.
         """
-        # Fetch more markets to search through
-        fetch_limit = max(500, limit * 10)
+        async with httpx.AsyncClient(timeout=self.timeout) as http:
+            resp = await http.get(
+                f"{GAMMA_API_BASE}/public-search",
+                params={
+                    "q": query,
+                    "limit_per_type": limit_per_type,
+                    "search_tags": "true",
+                    "search_profiles": "true",
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()
 
+    async def search_markets(self, query: str, limit: int = 20) -> list[Market]:
+        """Search markets by keyword using system search.
+
+        Replaces the old legacy local filtering logic.
+        """
+        search_data = await self.public_search(query, limit_per_type=limit)
+        markets = []
+
+        # Extract markets from events returned by search
+        for event_data in search_data.get("events", []):
+            event_markets = event_data.get("markets", [])
+            for m in event_markets:
+                markets.append(self._parse_market(m))
+                if len(markets) >= limit:
+                    return markets
+
+        return markets
+
+    async def get_tag_markets(self, tag_slug: str, limit: int = 50) -> list[Market]:
+        """Get markets associated with a specific tag."""
         async with httpx.AsyncClient(timeout=self.timeout) as http:
             resp = await http.get(
                 f"{GAMMA_API_BASE}/markets",
                 params={
+                    "tag_slug": tag_slug,
                     "closed": "false",
-                    "limit": fetch_limit,
-                    "order": "volume24hr",
-                    "ascending": "false",
+                    "limit": limit,
+                    "active": "true",
                 },
             )
             resp.raise_for_status()
+            return [self._parse_market(m) for m in resp.json()]
 
-            # Client-side filter by query in question or slug
-            query_lower = query.lower()
-            matches = []
-            for m in resp.json():
-                question = m.get("question", "").lower()
-                slug = m.get("slug", "").lower()
-                if query_lower in question or query_lower in slug:
-                    matches.append(self._parse_market(m))
-                    if len(matches) >= limit:
-                        break
+    async def get_related_tags(self, tag_slug: str) -> list[Tag]:
+        """Get tags related to a specific tag slug."""
+        async with httpx.AsyncClient(timeout=self.timeout) as http:
+            resp = await http.get(f"{GAMMA_API_BASE}/tags/slug/{tag_slug}/related-tags/tags")
+            resp.raise_for_status()
+            return [
+                Tag(id=str(t.get("id", "")), label=t.get("label", ""), slug=t.get("slug", ""))
+                for t in resp.json()
+            ]
 
-            return matches
+    async def discover_deep(self, query: str, max_depth: int = 1) -> list[Market]:
+        """
+        Recursive deep mining logic:
+        1. Search for keywords (Initial Interest Map)
+        2. Expand via Tags (Horizontal Mining)
+        3. Drill down into Events (Vertical Mining)
+        """
+        # 1. Search for initial "seed"
+        search_data = await self.public_search(query, limit_per_type=10)
+        found_markets = []
+        processed_event_ids = set()
+        processed_tag_slugs = set()
+
+        # 2. Extract markets and tags from found events
+        for event_data in search_data.get("events", []):
+            event_id = event_data.get("id")
+            if event_id in processed_event_ids:
+                continue
+            processed_event_ids.add(event_id)
+
+            # Vertical: Get all markets in this event
+            event_markets = event_data.get("markets", [])
+            for m in event_markets:
+                found_markets.append(self._parse_market(m))
+
+            # Horizontal: Track tags for further expansion
+            tags = event_data.get("tags", [])
+            for t in tags:
+                tag_slug = t.get("slug")
+                if tag_slug:
+                    processed_tag_slugs.add(tag_slug)
+
+        # 3. Horizontal Expansion (Depth 1)
+        if max_depth >= 1:
+            for tag_slug in list(processed_tag_slugs):
+                # Get related tags
+                try:
+                    related_tags = await self.get_related_tags(tag_slug)
+                    for rt in related_tags:
+                        if rt.slug not in processed_tag_slugs:
+                            # Fetch markets from related tags
+                            tag_markets = await self.get_tag_markets(rt.slug, limit=10)
+                            found_markets.extend(tag_markets)
+                            processed_tag_slugs.add(rt.slug)
+                except Exception:
+                    continue
+
+        # Deduplicate by condition_id
+        unique_markets = {}
+        for m in found_markets:
+            if m.condition_id not in unique_markets:
+                unique_markets[m.condition_id] = m
+
+        return list(unique_markets.values())
 
     async def get_market(self, market_id: str) -> Market:
         """Get market by ID."""
@@ -138,7 +232,8 @@ class GammaClient:
         if not token_ids:
             return {}
 
-        async with httpx.AsyncClient(timeout=self.timeout) as http:
+        headers = {"Accept": "application/json"}
+        async with httpx.AsyncClient(timeout=self.timeout, headers=headers) as http:
             resp = await http.get(
                 "https://clob.polymarket.com/prices",
                 params={"token_ids": ",".join(token_ids)},
