@@ -192,6 +192,16 @@ class GammaClient:
 
         return list(unique_markets.values())
 
+    async def get_markets_by_event(self, event_id: str) -> list[Market]:
+        """Get all markets belonging to a specific event ID."""
+        async with httpx.AsyncClient(timeout=self.timeout) as http:
+            resp = await http.get(
+                f"{GAMMA_API_BASE}/markets",
+                params={"event_id": event_id},
+            )
+            resp.raise_for_status()
+            return [self._parse_market(m) for m in resp.json()]
+
     async def get_market(self, market_id: str) -> Market:
         """Get market by ID."""
         async with httpx.AsyncClient(timeout=self.timeout) as http:
@@ -227,19 +237,23 @@ class GammaClient:
             resp.raise_for_status()
             return [self._parse_event(e) for e in resp.json()]
 
-    async def get_prices(self, token_ids: list[str]) -> dict[str, float]:
-        """Get current prices for token IDs."""
+    async def get_prices(self, token_ids: list[str], side: str = "BUY") -> dict[str, float]:
+        """Get current prices for token IDs using bulk POST endpoint."""
         if not token_ids:
             return {}
 
-        headers = {"Accept": "application/json"}
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        payload = [{"token_id": tid, "side": side} for tid in token_ids]
+        
         async with httpx.AsyncClient(timeout=self.timeout, headers=headers) as http:
-            resp = await http.get(
+            resp = await http.post(
                 "https://clob.polymarket.com/prices",
-                params={"token_ids": ",".join(token_ids)},
+                json=payload,
             )
             resp.raise_for_status()
-            return resp.json()
+            results = resp.json()
+            # Flatten the response structure: {tid: {side: price}} -> {tid: price}
+            return {tid: float(data.get(side, 0)) for tid, data in results.items()}
 
     def _parse_market(self, data: dict) -> Market:
         """Parse market JSON into Market dataclass."""

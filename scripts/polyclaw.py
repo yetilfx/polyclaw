@@ -6,7 +6,9 @@ Usage:
     polyclaw markets search "election"
     polyclaw market <id>
     polyclaw wallet status
-    polyclaw wallet approve
+    polyclaw audit
+    polyclaw arb scan --query ETH
+    polyclaw arb execute ETH_1.9k
     polyclaw buy <market_id> YES 50
     polyclaw positions
     polyclaw hedge scan
@@ -74,6 +76,12 @@ def main():
             return run_script("positions", ["show"] + args)
         else:
             return run_script("positions", ["list"])
+
+    elif command == "arb":
+        return run_script("scan_arbitrage", args)
+
+    elif command == "audit":
+        return run_script("audit", args)
 
     elif command == "hedge":
         return run_script("hedge", args)
